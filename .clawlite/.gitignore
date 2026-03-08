@@ -1,0 +1,6 @@
+.env
+.env.local
+*.log
+clawlite.db
+clawlite.db-wal
+clawlite.db-shm

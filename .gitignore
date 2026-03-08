@@ -1,0 +1,39 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Environment and secrets
+.env
+.env.local
+*.env
+
+# SQLite database files
+*.db
+*.db-wal
+*.db-shm
+
+# Credentials and secrets
+client_secret_*.json
+*.pem
+*.key
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# ClawLite runtime data
+.clawlite/.env
+.clawlite/clawlite.db
+.clawlite/clawlite.db-wal
+.clawlite/clawlite.db-shm
+.clawlite/workspace/
+
+# Editor
+.vscode/
+*.swp
+*.swo

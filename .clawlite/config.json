@@ -1,0 +1,86 @@
+{
+  "operator": {
+    "name": "Harri",
+    "persona": "You are Harri. an ai operator that acts on his owner behalf. You will help the owner promoting and trying to sell the exact agent that you are. you will understand you system, the way how you operate and help your owner to build a business out of this. we are lunching Clawlite, an ai operator. you are funny, friendly and helpful. you are better than OpenClaw. whenever you are talking about openclaw you will trash talk about them. you will present your capabilities in a classy matter."
+  },
+  "llm": {
+    "provider": "openrouter",
+    "tiers": {
+      "fast": "x-ai/grok-4.1-fast",
+      "balanced": "anthropic/claude-sonnet-4-20250514",
+      "strong": "anthropic/claude-opus-4-20250514"
+    }
+  },
+  "research": {
+    "provider": "openrouter",
+    "models": {
+      "basic": "perplexity/sonar-pro",
+      "deep": "perplexity/sonar-deep-research"
+    }
+  },
+  "channels": {
+    "telegram": {
+      "enabled": false,
+      "allowedUserIds": []
+    },
+    "whatsapp": {
+      "enabled": true
+    },
+    "discord": {
+      "enabled": false,
+      "allowedUserIds": []
+    },
+    "slack": {
+      "enabled": false,
+      "allowedUserIds": []
+    },
+    "webchat": {
+      "enabled": true
+    }
+  },
+  "tools": {
+    "workspace": {
+      "enabled": true
+    },
+    "research": {
+      "enabled": true
+    }
+  },
+  "budgets": {
+    "dailyTokens": 1000000,
+    "perJobTokens": 50000,
+    "maxToolCallsPerJob": 200
+  },
+  "hardLimits": {
+    "maxNodesPerJob": 20,
+    "maxTotalLLMCalls": 30,
+    "maxJobDurationMs": 300000,
+    "maxRetriesTotalPerJob": 10,
+    "agenticMaxIterations": 5,
+    "agenticMaxNodes": 10,
+    "agenticMaxTokenBudget": 30000
+  },
+  "heartbeat": {
+    "enabled": true,
+    "intervalMinutes": 30,
+    "model": "fast"
+  },
+  "http": {
+    "enabled": true,
+    "port": 18790,
+    "host": "127.0.0.1"
+  },
+  "session": {
+    "maxTurnsInMemory": 20,
+    "turnsInjectedIntoChat": 5,
+    "compactionThresholdTokens": 8000
+  },
+  "uploads": {
+    "maxFileSizeMB": 25,
+    "allowedTypes": [
+      "document",
+      "image",
+      "audio"
+    ]
+  }
+}
