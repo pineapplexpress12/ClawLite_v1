@@ -1,12 +1,7 @@
 import axios from 'axios';
 import { getSecret } from '../../core/secrets.js';
 import { getConfig } from '../../core/config.js';
-import type { Message, LLMResponse } from '../provider.js';
-
-interface CallParams {
-  messages: Message[];
-  format?: 'json' | 'text';
-}
+import type { LLMResponse, CallParams } from '../provider.js';
 
 /**
  * Generic OpenAI-compatible provider. Used by xAI, DeepSeek, Groq, Ollama, and custom endpoints.
@@ -50,6 +45,11 @@ export async function callOpenAICompatible(
     body.response_format = { type: 'json_object' };
   }
 
+  if (params.tools && params.tools.length > 0) {
+    body.tools = params.tools;
+    body.tool_choice = params.tool_choice ?? 'auto';
+  }
+
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
   };
@@ -66,16 +66,23 @@ export async function callOpenAICompatible(
   });
 
   const data = response.data;
-  const text = data.choices?.[0]?.message?.content ?? '';
+  const message = data.choices?.[0]?.message;
+  const text = message?.content ?? '';
   const usage = data.usage ?? {};
   const totalTokens = usage.total_tokens ?? ((usage.prompt_tokens ?? 0) + (usage.completion_tokens ?? 0));
+  const finishReason = data.choices?.[0]?.finish_reason;
 
   const result: LLMResponse = {
     text,
     usage: { total_tokens: totalTokens },
+    finishReason: finishReason ?? 'stop',
   };
 
-  if (params.format === 'json') {
+  if (message?.tool_calls?.length > 0) {
+    result.toolCalls = message.tool_calls;
+  }
+
+  if (params.format === 'json' && text) {
     try {
       result.parsed = JSON.parse(text);
     } catch {

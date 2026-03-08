@@ -1,13 +1,8 @@
 import axios from 'axios';
 import { getSecret } from '../../core/secrets.js';
-import type { Message, LLMResponse } from '../provider.js';
+import type { LLMResponse, CallParams } from '../provider.js';
 
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
-
-interface CallParams {
-  messages: Message[];
-  format?: 'json' | 'text';
-}
 
 export async function callOpenRouter(
   modelId: string,
@@ -27,6 +22,12 @@ export async function callOpenRouter(
     body.response_format = { type: 'json_object' };
   }
 
+  // Tool calling support
+  if (params.tools && params.tools.length > 0) {
+    body.tools = params.tools;
+    body.tool_choice = params.tool_choice ?? 'auto';
+  }
+
   const response = await axios.post(OPENROUTER_URL, body, {
     headers: {
       'Authorization': `Bearer ${apiKey}`,
@@ -38,15 +39,23 @@ export async function callOpenRouter(
   });
 
   const data = response.data;
-  const text = data.choices?.[0]?.message?.content ?? '';
+  const message = data.choices?.[0]?.message;
+  const text = message?.content ?? '';
   const usage = data.usage ?? { total_tokens: 0 };
+  const finishReason = data.choices?.[0]?.finish_reason;
 
   const result: LLMResponse = {
     text,
     usage: { total_tokens: usage.total_tokens ?? (usage.prompt_tokens ?? 0) + (usage.completion_tokens ?? 0) },
+    finishReason: finishReason ?? 'stop',
   };
 
-  if (params.format === 'json') {
+  // Extract tool calls if present
+  if (message?.tool_calls && message.tool_calls.length > 0) {
+    result.toolCalls = message.tool_calls;
+  }
+
+  if (params.format === 'json' && text) {
     try {
       result.parsed = JSON.parse(text);
     } catch {

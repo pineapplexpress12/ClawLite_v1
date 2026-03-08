@@ -7,15 +7,50 @@ import { callGoogleAI } from './providers/google.js';
 import { callOpenAICompatible } from './providers/openaiCompatible.js';
 import { callMistral } from './providers/mistral.js';
 
-export interface Message {
-  role: 'system' | 'user' | 'assistant';
+// --- Tool-calling types ---
+
+export interface ToolCall {
+  id: string;
+  type: 'function';
+  function: { name: string; arguments: string };
+}
+
+export interface ToolCallMessage {
+  role: 'assistant';
+  content: string | null;
+  tool_calls: ToolCall[];
+}
+
+export interface ToolResultMessage {
+  role: 'tool';
+  tool_call_id: string;
   content: string;
 }
+
+export interface LLMToolDef {
+  type: 'function';
+  function: {
+    name: string;
+    description: string;
+    parameters: Record<string, unknown>;
+  };
+}
+
+// --- Core types ---
+
+export type Message =
+  | { role: 'system'; content: string }
+  | { role: 'user'; content: string }
+  | { role: 'assistant'; content: string }
+  | ToolCallMessage
+  | ToolResultMessage;
 
 export interface LLMResponse {
   text: string;
   parsed?: unknown;
   usage: { total_tokens: number };
+  toolCalls?: ToolCall[];
+  finishReason?: string;
 }
 
 export interface CompleteParams {
@@ -23,6 +58,8 @@ export interface CompleteParams {
   messages?: Message[];
   prompt?: string;
   format?: 'json' | 'text';
+  tools?: LLMToolDef[];
+  tool_choice?: 'auto' | 'none' | { type: 'function'; function: { name: string } };
 }
 
 /**
@@ -38,7 +75,12 @@ export async function complete(params: CompleteParams): Promise<LLMResponse> {
     { role: 'user', content: params.prompt ?? '' },
   ];
 
-  const callParams = { messages, format: params.format };
+  const callParams: CallParams = {
+    messages,
+    format: params.format,
+    tools: params.tools,
+    tool_choice: params.tool_choice,
+  };
 
   switch (provider) {
     case 'openrouter':
@@ -75,3 +117,13 @@ export async function complete(params: CompleteParams): Promise<LLMResponse> {
 }
 
 export const llm = { complete };
+
+/**
+ * Shared call params passed to each provider.
+ */
+export interface CallParams {
+  messages: Message[];
+  format?: 'json' | 'text';
+  tools?: LLMToolDef[];
+  tool_choice?: 'auto' | 'none' | { type: 'function'; function: { name: string } };
+}

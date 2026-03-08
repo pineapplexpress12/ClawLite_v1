@@ -1,10 +1,5 @@
 import { getSecret } from '../../core/secrets.js';
-import type { Message, LLMResponse } from '../provider.js';
-
-interface CallParams {
-  messages: Message[];
-  format?: 'json' | 'text';
-}
+import type { LLMResponse, CallParams } from '../provider.js';
 
 export async function callOpenAI(
   modelId: string,
@@ -28,18 +23,30 @@ export async function callOpenAI(
     body.response_format = { type: 'json_object' };
   }
 
+  if (params.tools && params.tools.length > 0) {
+    body.tools = params.tools;
+    body.tool_choice = params.tool_choice ?? 'auto';
+  }
+
   const response = await client.chat.completions.create(body as Parameters<typeof client.chat.completions.create>[0]);
 
-  const text = response.choices?.[0]?.message?.content ?? '';
+  const message = response.choices?.[0]?.message;
+  const text = message?.content ?? '';
   const usage = response.usage;
   const totalTokens = usage?.total_tokens ?? ((usage?.prompt_tokens ?? 0) + (usage?.completion_tokens ?? 0));
+  const finishReason = response.choices?.[0]?.finish_reason;
 
   const result: LLMResponse = {
     text,
     usage: { total_tokens: totalTokens },
+    finishReason: finishReason ?? 'stop',
   };
 
-  if (params.format === 'json') {
+  if ((message as any)?.tool_calls?.length > 0) {
+    result.toolCalls = (message as any).tool_calls;
+  }
+
+  if (params.format === 'json' && text) {
     try {
       result.parsed = JSON.parse(text);
     } catch {

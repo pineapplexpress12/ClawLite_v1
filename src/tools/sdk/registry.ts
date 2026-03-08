@@ -34,6 +34,10 @@ export function listTools(): ToolInfo[] {
   }));
 }
 
+export function getAllTools(): ToolDefinition[] {
+  return Array.from(tools.values());
+}
+
 export function hasTools(): boolean {
   return tools.size > 0;
 }

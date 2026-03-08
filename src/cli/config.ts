@@ -1,6 +1,12 @@
 import type { Command } from 'commander';
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
-import { join } from 'node:path';
+import {
+  loadRawConfig,
+  saveRawConfig,
+  getNestedValue,
+  setNestedValue,
+  parseValue,
+  redactSecrets,
+} from '../core/configIO.js';
 
 /**
  * Register config get/set/show/validate commands.
@@ -81,54 +87,3 @@ export function registerConfigCommands(program: Command): void {
     });
 }
 
-function getConfigPath(): string {
-  const home = process.env.CLAWLITE_HOME ?? join(process.env.HOME ?? '', '.clawlite');
-  return join(home, 'config.json');
-}
-
-function loadRawConfig(): Record<string, unknown> {
-  const path = getConfigPath();
-  if (!existsSync(path)) throw new Error(`Config not found: ${path}. Run "clawlite setup" first.`);
-  return JSON.parse(readFileSync(path, 'utf-8'));
-}
-
-function saveRawConfig(data: Record<string, unknown>): void {
-  writeFileSync(getConfigPath(), JSON.stringify(data, null, 2));
-}
-
-function getNestedValue(obj: any, path: string): unknown {
-  return path.split('.').reduce((o, k) => o?.[k], obj);
-}
-
-function setNestedValue(obj: any, path: string, value: unknown): void {
-  const keys = path.split('.');
-  const last = keys.pop()!;
-  const parent = keys.reduce((o, k) => {
-    if (!(k in o)) o[k] = {};
-    return o[k];
-  }, obj);
-  parent[last] = value;
-}
-
-function parseValue(value: string): unknown {
-  if (value === 'true') return true;
-  if (value === 'false') return false;
-  const num = Number(value);
-  if (!isNaN(num) && value.trim() !== '') return num;
-  return value;
-}
-
-function redactSecrets(obj: any): any {
-  if (typeof obj !== 'object' || obj === null) return obj;
-  const result: any = Array.isArray(obj) ? [] : {};
-  for (const [key, value] of Object.entries(obj)) {
-    if (/key|token|secret|password/i.test(key) && typeof value === 'string') {
-      result[key] = value.slice(0, 6) + '***REDACTED***';
-    } else if (typeof value === 'object') {
-      result[key] = redactSecrets(value);
-    } else {
-      result[key] = value;
-    }
-  }
-  return result;
-}

@@ -1,13 +1,8 @@
 import axios from 'axios';
 import { getSecret } from '../../core/secrets.js';
-import type { Message, LLMResponse } from '../provider.js';
+import type { LLMResponse, CallParams } from '../provider.js';
 
 const GOOGLE_API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
-
-interface CallParams {
-  messages: Message[];
-  format?: 'json' | 'text';
-}
 
 export async function callGoogleAI(
   modelId: string,
@@ -18,13 +13,13 @@ export async function callGoogleAI(
     throw new Error('GOOGLE_API_KEY not configured. Add it to .clawlite/.env');
   }
 
-  // Convert messages to Google's format
+  // Convert messages to Google's format (skip tool messages)
   const systemMsg = params.messages.find(m => m.role === 'system');
-  const conversationMsgs = params.messages.filter(m => m.role !== 'system');
+  const conversationMsgs = params.messages.filter(m => m.role !== 'system' && m.role !== 'tool');
 
   const contents = conversationMsgs.map(m => ({
     role: m.role === 'assistant' ? 'model' : 'user',
-    parts: [{ text: m.content }],
+    parts: [{ text: 'content' in m && typeof m.content === 'string' ? m.content : '' }],
   }));
 
   const body: Record<string, unknown> = {
@@ -32,7 +27,7 @@ export async function callGoogleAI(
     generationConfig: {},
   };
 
-  if (systemMsg) {
+  if (systemMsg && 'content' in systemMsg) {
     body.systemInstruction = { parts: [{ text: systemMsg.content }] };
   }
 
@@ -55,6 +50,7 @@ export async function callGoogleAI(
   const result: LLMResponse = {
     text,
     usage: { total_tokens: totalTokens },
+    finishReason: 'stop',
   };
 
   if (params.format === 'json') {

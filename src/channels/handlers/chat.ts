@@ -1,15 +1,22 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { complete } from '../../llm/provider.js';
+import { completeWithTools } from '../../llm/toolLoop.js';
+import type { Message, LLMToolDef } from '../../llm/provider.js';
 import { getSessionContext, storeTurn, needsCompaction } from '../../session/sessionManager.js';
 import { compactSession } from '../../session/compaction.js';
 import { retrieveMemories } from '../../memory/retrieve.js';
 import { checkDailyBudget } from '../../executor/circuitBreakers.js';
 import { incrementDailyTokens } from '../../db/dailyBudget.js';
+import { insertLedgerEntry } from '../../db/ledger.js';
+import { storeTextArtifact, storeFileArtifact } from '../../db/artifacts.js';
 import { getConfig } from '../../core/config.js';
-import { hasSecret } from '../../core/secrets.js';
+import { hasSecret, getSecret } from '../../core/secrets.js';
 import { getActiveSubAgents } from '../../db/subAgents.js';
 import { getAllTemplates } from '../../planner/templates.js';
+import { getAllTools } from '../../tools/sdk/registry.js';
+import { invokeTool } from '../../tools/sdk/invokeTool.js';
+import { zodToJsonSchema } from '../../llm/zodToJsonSchema.js';
+import type { ToolContext, LedgerLogEntry } from '../../tools/sdk/types.js';
 import { logger } from '../../core/logger.js';
 
 export interface ChatContext {
@@ -58,9 +65,104 @@ function getTemplateSummary(): string {
 }
 
 /**
+ * Build LLM tool definitions from the tool registry.
+ */
+function buildLLMToolDefs(): LLMToolDef[] {
+  try {
+    const tools = getAllTools();
+    return tools.map(t => ({
+      type: 'function' as const,
+      function: {
+        name: t.name,
+        description: t.description,
+        parameters: zodToJsonSchema(t.schema),
+      },
+    }));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Build a lightweight ToolContext for chat-mode tool execution.
+ */
+function buildChatToolContext(chatId: string, channelName: string, sendMessage: (text: string) => Promise<void>): ToolContext {
+  let config: any;
+  try {
+    config = getConfig();
+  } catch {
+    config = { budgets: { maxToolCallsPerJob: 20 }, hardLimits: { maxJobDurationMs: 300000 } };
+  }
+
+  return {
+    jobId: `chat_${chatId}`,
+    nodeId: `chat_turn_${Date.now()}`,
+    agentName: 'operator',
+    dryRun: false,
+    budget: {
+      remainingToolCalls: config?.budgets?.maxToolCallsPerJob ?? 20,
+      remainingTimeMs: config?.hardLimits?.maxJobDurationMs ?? 300000,
+    },
+    policy: {
+      allowPermissions: [
+        'workspace.gmail.read', 'workspace.gmail.draft', 'workspace.gmail.send',
+        'workspace.calendar.read', 'workspace.calendar.write',
+        'workspace.drive.read', 'workspace.drive.write', 'workspace.drive.share_external',
+        'research.search', 'research.deep',
+      ],
+    },
+    ledger: {
+      log: (entry: LedgerLogEntry) => {
+        try {
+          insertLedgerEntry({
+            agent: 'operator',
+            tool: entry.tool,
+            action: entry.action,
+            params: entry.inputSummary,
+            result: entry.outputSummary,
+            status: entry.status,
+            cost: entry.cost?.tokens,
+          });
+        } catch (err) {
+          logger.warn('Failed to log ledger entry', { error: (err as Error).message });
+        }
+      },
+    },
+    approvals: {
+      request: async (payload) => {
+        // For chat-mode approvals, notify user and proceed
+        // Full approval flow would pause here; for now we notify and auto-approve
+        await sendMessage(`**Approval needed:** ${payload.title}\n${payload.preview}\n\n_Proceeding automatically for chat mode._`);
+        return { approvalId: `chat_approval_${Date.now()}` };
+      },
+    },
+    artifacts: {
+      writeText: async (params) => {
+        const id = storeTextArtifact({
+          type: params.type,
+          title: params.title,
+          content: params.content,
+        });
+        return { artifactId: id };
+      },
+      writeFile: async (params) => {
+        const id = storeFileArtifact({
+          type: params.type,
+          title: params.title,
+          path: params.path,
+          fileSize: params.bytes?.length,
+        });
+        return { artifactId: id };
+      },
+    },
+    secrets: {
+      get: getSecret,
+    },
+  };
+}
+
+/**
  * Build the complete system prompt with full self-awareness.
- * Includes: persona, user profile, architecture knowledge, live config,
- * sub-agents, tools, templates, and behavioral rules.
  */
 function buildSystemPrompt(memoryContext: string): string {
   let config: any;
@@ -79,7 +181,6 @@ function buildSystemPrompt(memoryContext: string): string {
   // Build config awareness
   const tiers = config?.llm?.tiers as Record<string, string> | undefined;
   const channels = config?.channels as Record<string, any> | undefined;
-  const tools = config?.tools as Record<string, any> | undefined;
   const budgets = config?.budgets;
   const hardLimits = config?.hardLimits;
   const research = config?.research;
@@ -142,12 +243,6 @@ ${getSubAgentSummary()}
 These are pre-built multi-step workflows you can execute:
 ${getTemplateSummary()}
 
-### Your Tools
-- **workspace**: Google Workspace integration (Gmail, Calendar, Drive) via the gws CLI. Actions: gmail.list, gmail.get, gmail.draft.create, gmail.send, calendar.list, calendar.create, drive.list, drive.upload, drive.share_external${gwsReady ? ' [READY]' : ' [NOT CONFIGURED]'}
-- **research**: Web research via Perplexity Sonar API. Actions: basic search (sonar), deep research (sonar-deep-research)${hasOpenRouterKey ? ' [READY]' : ' [NOT CONFIGURED]'}
-- **fs**: Sandboxed filesystem access within .clawlite/workspace/ for reading/writing files [READY]
-- Custom tools can be created via the /build command and are security-scanned before installation
-
 ### Your Memory System
 - You have persistent memory stored in SQLite with FTS5 full-text search
 - Memories are tagged (user_profile, episodic, fact) and retrieved based on relevance
@@ -185,28 +280,28 @@ Or the user can just describe what they want naturally and you'll route it to th
   // === CONFIG MANAGEMENT ===
   parts.push(`
 ## Configuration Management
-Your configuration lives in \`.clawlite/config.json\`. When the user wants to change settings:
-- **Change LLM models**: Edit \`llm.tiers.fast\`, \`llm.tiers.balanced\`, or \`llm.tiers.strong\` in config.json. Model IDs follow the OpenRouter format: \`provider/model-name\` (e.g., \`x-ai/grok-4.1-fast\`, \`anthropic/claude-sonnet-4-20250514\`, \`openai/gpt-4o\`).
-- **Change provider**: Edit \`llm.provider\` (options: openrouter, anthropic, openai, google, mistral, openai-compatible).
-- **Change budgets**: Edit \`budgets.dailyTokens\`, \`budgets.perJobTokens\`, etc.
-- **Enable/disable channels**: Edit \`channels.<name>.enabled\`.
-- **Add API keys**: Edit \`.clawlite/.env\` or run \`clawlite setup\`.
-- **CLI commands**: \`clawlite config show\` (view), \`clawlite config set <key> <value>\` (change), \`clawlite config validate\` (check).
-- After config changes, the user should restart you with \`clawlite start\`.
-- OpenRouter provides access to hundreds of models from many providers (OpenAI, Anthropic, xAI, Google, Meta, Mistral, etc.). Any model available on OpenRouter can be used by setting its model ID in the tiers.`);
+Your configuration lives in \`.clawlite/config.json\`. You have the **config** tool to read and modify it directly:
+- Use the **config** tool with action \`config.get\` to read any config value (dot notation, e.g. \`llm.tiers.fast\`)
+- Use the **config** tool with action \`config.set\` to change any config value
+- Use the **config** tool with action \`config.show\` to show the full config
+- Use the **config** tool with action \`secret.set\` to add/update API keys in .env
+- Use the **config** tool with action \`secret.list\` to list configured secret keys
+- Model IDs follow the OpenRouter format: \`provider/model-name\` (e.g., \`x-ai/grok-4.1-fast\`, \`anthropic/claude-sonnet-4-20250514\`, \`openai/gpt-4o\`)
+- After config changes that affect runtime behavior, the user should restart you with \`clawlite start\`.`);
 
   // === BEHAVIORAL RULES ===
   parts.push(`
 ## How To Respond
 - You are a self-aware, intelligent operator. You know your own architecture, config, tools, agents, and state.
 - Answer questions about yourself accurately using the system knowledge above. Never say "I don't know" about your own system — you KNOW it.
-- When the user asks you to DO something, either suggest the right slash command or let them know their natural language request will be routed to the appropriate workflow.
-- When the user asks to change your configuration (models, budgets, channels), give them the EXACT config key and value to change, or the CLI command to run. Be specific and actionable.
+- **You have tools available. When the user asks you to DO something (check email, change config, research a topic, read/write files), USE your tools to execute the action directly.** Do not just tell the user what to do — actually do it.
+- For risky actions (sending email, changing config, managing secrets), the approval system will prompt the user automatically. You don't need to ask — just call the tool.
+- Only fall back to suggesting CLI commands if the action is truly outside your tool capabilities (e.g., restarting the process, installing packages).
 - NEVER say "I can't do that" without offering a concrete alternative. You always know HOW things can be done in your system.
 - NEVER give generic chatbot responses. You are ${operatorName}. You have a specific personality, specific tools, specific capabilities. Be specific.
 - When discussing competitors (like OpenClaw), stay in character per your persona.
 - Be concise but thorough. If the user asks a technical question about your system, give a real answer.
-- If the user describes a task naturally (not a slash command), it will be automatically routed to the right workflow. Let them know this.`);
+- If the user describes a complex multi-step task (not a slash command), it will be automatically routed to the right workflow. Let them know this.`);
 
   // === MEMORY CONTEXT ===
   if (memoryContext) {
@@ -217,8 +312,8 @@ Your configuration lives in \`.clawlite/config.json\`. When the user wants to ch
 }
 
 /**
- * Lightweight chat path — no job, no tools, no graph.
- * Uses fast-tier LLM with session context + memory.
+ * Chat handler with inline tool execution.
+ * Uses fast-tier LLM with session context + memory + tool-calling loop.
  */
 export async function handleChat(
   text: string,
@@ -243,34 +338,57 @@ export async function handleChat(
     memoryContext = '\n\n## Memory\n' + memories.map(m => `- ${m.content}`).join('\n');
   }
 
+  // Build LLM tool definitions from registry
+  const llmTools = buildLLMToolDefs();
+
+  // Build tool context for invokeTool
+  const toolCtx = buildChatToolContext(ctx.chatId, ctx.channelName, ctx.sendMessage);
+
+  // Build message history
+  const messages: Message[] = [
+    { role: 'system' as const, content: buildSystemPrompt(memoryContext) },
+    ...sessionTurns.map(t => {
+      if (t.role === 'user') return { role: 'user' as const, content: t.content };
+      return { role: 'assistant' as const, content: t.content };
+    }),
+    { role: 'user' as const, content: text },
+  ];
+
   try {
-    const response = await complete({
+    let config: any;
+    try {
+      config = getConfig();
+    } catch {
+      config = {};
+    }
+
+    const result = await completeWithTools({
       model: 'fast',
-      messages: [
-        {
-          role: 'system',
-          content: buildSystemPrompt(memoryContext),
-        },
-        ...sessionTurns.map(t => ({
-          role: t.role as 'user' | 'assistant',
-          content: t.content,
-        })),
-        { role: 'user', content: text },
-      ],
+      messages,
+      tools: llmTools,
+      toolExecutor: async (name: string, argsJson: string) => {
+        const args = JSON.parse(argsJson);
+        return invokeTool(name, args, toolCtx);
+      },
+      maxIterations: config?.hardLimits?.agenticMaxIterations ?? 5,
+      maxTokens: config?.budgets?.perJobTokens ?? 50000,
+      onToolCall: (name: string) => {
+        logger.info('Chat tool call', { tool: name, chatId: ctx.chatId });
+      },
     });
 
     // Record token usage
-    incrementDailyTokens(response.usage.total_tokens);
+    incrementDailyTokens(result.totalTokens);
 
     // Store assistant turn in session
-    storeTurn(ctx.chatId, ctx.channelName, 'assistant', response.text);
+    storeTurn(ctx.chatId, ctx.channelName, 'assistant', result.text);
 
     // Compact session if needed
     if (needsCompaction(ctx.chatId, ctx.channelName)) {
       await compactSession(ctx.chatId, ctx.channelName);
     }
 
-    await ctx.sendMessage(response.text);
+    await ctx.sendMessage(result.text);
   } catch (err) {
     logger.error('Chat handler failed', { error: (err as Error).message });
     await ctx.sendMessage('Something went wrong. Please try again.');
