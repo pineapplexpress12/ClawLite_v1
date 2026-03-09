@@ -17,6 +17,22 @@ export const ResearchTool: ToolDefinition<typeof schema> = {
   requiredSecrets: [],
   schema,
 
+  jsonSchema: {
+    type: 'object',
+    properties: {
+      action: {
+        type: 'string',
+        enum: ['search', 'deep'],
+        description: 'Type of research: "search" for quick web search, "deep" for in-depth research',
+      },
+      query: {
+        type: 'string',
+        description: 'The search query or research topic',
+      },
+    },
+    required: ['action', 'query'],
+  },
+
   async handler(params, ctx: ToolContext) {
     const requiredPerm = params.action === 'deep' ? 'research.deep' : 'research.search';
     if (!ctx.policy.allowPermissions.includes(requiredPerm)) {

@@ -23,61 +23,86 @@ const PERMISSION_MAP: Record<string, string> = {
   'drive.share_external': 'workspace.drive.share_external',
 };
 
-const APPROVAL_REQUIRED = new Set([
-  'gmail.send', 'calendar.create', 'drive.share_external',
-]);
-
 function buildGwsArgs(action: string, params: Record<string, unknown>): string[] {
-  const parts = action.split('.');
   const args: string[] = [];
 
-  // Map actions to gws CLI args
   switch (action) {
     case 'gmail.list':
-      args.push('gmail', 'users', 'messages', 'list', '--page-all');
+      args.push('gmail', 'users', 'messages', 'list');
+      if (Object.keys(params).length > 0) {
+        args.push('--params', JSON.stringify(params));
+      }
       break;
     case 'gmail.get':
       args.push('gmail', 'users', 'messages', 'get');
+      if (Object.keys(params).length > 0) {
+        args.push('--params', JSON.stringify(params));
+      }
       break;
     case 'gmail.draft.create':
       args.push('gmail', 'users', 'drafts', 'create');
+      if (params.raw) {
+        args.push('--json', JSON.stringify({ message: { raw: params.raw } }));
+      } else if (Object.keys(params).length > 0) {
+        args.push('--params', JSON.stringify(params));
+      }
       break;
     case 'gmail.send':
       args.push('gmail', 'users', 'messages', 'send');
+      if (params.raw) {
+        args.push('--json', JSON.stringify({ raw: params.raw }));
+      } else if (Object.keys(params).length > 0) {
+        args.push('--json', JSON.stringify(params));
+      }
       break;
     case 'calendar.list':
       args.push('calendar', 'events', 'list', '--page-all');
+      if (Object.keys(params).length > 0) {
+        args.push('--params', JSON.stringify(params));
+      }
       break;
     case 'calendar.create':
       args.push('calendar', 'events', 'insert');
+      if (Object.keys(params).length > 0) {
+        args.push('--json', JSON.stringify(params));
+      }
       break;
     case 'drive.list':
       args.push('drive', 'files', 'list', '--page-all');
+      if (Object.keys(params).length > 0) {
+        args.push('--params', JSON.stringify(params));
+      }
       break;
     case 'drive.upload':
       args.push('drive', 'files', 'create');
+      if (Object.keys(params).length > 0) {
+        args.push('--params', JSON.stringify(params));
+      }
       break;
     case 'drive.share_external':
       args.push('drive', 'permissions', 'create');
+      if (Object.keys(params).length > 0) {
+        args.push('--params', JSON.stringify(params));
+      }
       break;
-    default:
+    default: {
+      const parts = action.split('.');
       args.push(...parts);
-  }
-
-  if (Object.keys(params).length > 0) {
-    args.push('--params', JSON.stringify(params));
+      if (Object.keys(params).length > 0) {
+        args.push('--params', JSON.stringify(params));
+      }
+    }
   }
 
   return args;
 }
 
-async function runGwsCommand(args: string[], credentialsPath: string): Promise<unknown[]> {
+async function runGwsCommand(args: string[]): Promise<unknown[]> {
   return new Promise((resolve, reject) => {
+    console.log('[GWS CMD]', 'gws', args.join(' '));
+
     const proc = spawn('gws', args, {
-      env: {
-        ...process.env,
-        GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE: credentialsPath,
-      },
+      env: { ...process.env },
     });
 
     const chunks: Buffer[] = [];
@@ -87,23 +112,27 @@ async function runGwsCommand(args: string[], credentialsPath: string): Promise<u
     proc.stderr.on('data', (chunk: Buffer) => errors.push(chunk));
 
     proc.on('close', (code) => {
+      const rawStdout = Buffer.concat(chunks).toString().trim();
+      const rawStderr = Buffer.concat(errors).toString().trim();
+
+      console.log('[GWS STDOUT]', rawStdout.slice(0, 500));
+      if (rawStderr) console.log('[GWS STDERR]', rawStderr.slice(0, 500));
+
       if (code !== 0) {
-        return reject(new Error(Buffer.concat(errors).toString().trim()));
+        return reject(new Error(rawStderr || `gws exited with code ${code}`));
       }
 
-      // gws --page-all returns NDJSON (one JSON object per line)
-      const raw = Buffer.concat(chunks).toString().trim();
-      if (!raw) return resolve([]);
+      if (!rawStdout) return resolve([]);
 
-      const lines = raw.split('\n').filter(Boolean);
+      const lines = rawStdout.split('\n').filter(Boolean);
       try {
         const parsed = lines.map(line => JSON.parse(line));
         resolve(parsed);
       } catch {
         try {
-          resolve([JSON.parse(raw)]);
+          resolve([JSON.parse(rawStdout)]);
         } catch {
-          resolve([{ raw }]);
+          resolve([{ raw: rawStdout }]);
         }
       }
     });
@@ -122,36 +151,59 @@ export const WorkspaceTool: ToolDefinition<typeof schema> = {
     'workspace.drive.read', 'workspace.drive.write', 'workspace.drive.share_external',
   ],
   risk: 'high',
-  requiredSecrets: [
-    { envVar: 'GWS_CREDENTIALS_PATH', description: 'Path to Google Workspace CLI credentials JSON' },
-  ],
+  requiredSecrets: [],
   schema,
+  jsonSchema: {
+    type: 'object',
+    properties: {
+      action: {
+        type: 'string',
+        enum: ['gmail.list', 'gmail.get', 'gmail.draft.create', 'gmail.send', 'calendar.list', 'calendar.create', 'drive.list', 'drive.upload', 'drive.share_external'],
+        description: 'The workspace action to perform',
+      },
+      params: {
+        type: 'object',
+        description: 'Additional parameters for the action',
+      },
+    },
+    required: ['action'],
+  },
 
   async handler(params, ctx: ToolContext) {
+    const { execSync } = await import('node:child_process');
+    try {
+      execSync('gws --version', { stdio: 'ignore' });
+    } catch {
+      return {
+        status: 'not_connected',
+        error: 'Google Workspace CLI (gws) is not installed or not authenticated.',
+        action: 'Use the gws_connect tool to set up Google Workspace.',
+      };
+    }
+
     const requiredPerm = PERMISSION_MAP[params.action];
     if (requiredPerm && !ctx.policy.allowPermissions.includes(requiredPerm)) {
       return { status: 'blocked', reason: 'permission_denied', missingPermission: requiredPerm };
     }
 
-    // Check approval requirement
-    if (APPROVAL_REQUIRED.has(params.action)) {
-      const { approvalId } = await ctx.approvals.request({
-        actionType: params.action,
-        title: `Execute ${params.action}`,
-        preview: JSON.stringify(params.params, null, 2),
-        data: params,
-      });
-      return { status: 'waiting_approval', approvalId };
-    }
+    try {
+      const args = buildGwsArgs(params.action, params.params);
+      const result = await runGwsCommand(args);
+      return { data: result };
+    } catch (err) {
+      const errMsg = (err as Error).message;
+      console.log('[WORKSPACE ERROR]', errMsg);
 
-    const credentialsPath = ctx.secrets.get('GWS_CREDENTIALS_PATH');
-    if (!credentialsPath) {
-      throw new Error('GWS_CREDENTIALS_PATH not configured');
-    }
+      if (errMsg.includes('auth') || errMsg.includes('credential') || errMsg.includes('token') || errMsg.includes('ENOENT')) {
+        return {
+          status: 'not_connected',
+          error: 'Google Workspace authentication failed or expired.',
+          action: 'Use the gws_connect tool to reconnect.',
+        };
+      }
 
-    const args = buildGwsArgs(params.action, params.params);
-    const result = await runGwsCommand(args, credentialsPath);
-    return { data: result };
+      return { error: errMsg };
+    }
   },
 
   async mockHandler(params) {

@@ -61,12 +61,16 @@ export const BUILTIN_TEMPLATES: GraphTemplate[] = [
   {
     id: 'send_email',
     name: 'Send Email',
-    description: 'Send draft email',
+    description: 'Compose and send an email',
     slashCommand: '/send',
-    alternateMatches: ['send the draft', 'send it'],
-    slots: [{ name: 'draftId', description: 'Draft email ID to send', required: true, default: null }],
+    alternateMatches: ['send an email', 'email to', 'send a message to', 'write an email'],
+    slots: [
+      { name: 'to', description: 'Recipient email address', required: true, default: null },
+      { name: 'subject', description: 'Email subject line', required: false, default: 'Hello' },
+      { name: 'instructions', description: 'What the email should say or instructions for drafting', required: false, default: null },
+    ],
     nodes: [
-      { id: 'gmail_send', type: 'gmail.send', title: 'Send email', description: 'Send the draft email', assignedAgent: 'WorkspaceAgent', model: 'fast', dependencies: [], requiresApproval: true, input: { draftId: '{{slots.draftId}}' }, toolPermissions: ['workspace.gmail.send'] },
+      { id: 'gmail_send', type: 'gmail.send', title: 'Send email', description: 'Compose and send the email', assignedAgent: 'WorkspaceAgent', model: 'fast', dependencies: [], requiresApproval: true, input: { to: '{{slots.to}}', subject: '{{slots.subject}}', instructions: '{{slots.instructions}}' }, toolPermissions: ['workspace.gmail.send'] },
     ],
   },
   {

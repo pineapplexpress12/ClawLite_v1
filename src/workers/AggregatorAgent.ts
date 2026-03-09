@@ -3,6 +3,22 @@ import type { ToolContext, WorkerResult } from '../tools/sdk/types.js';
 import type { NodeRow } from '../db/nodes.js';
 import { complete } from '../llm/provider.js';
 import { getArtifactsByNodeIds } from '../db/artifacts.js';
+import { logger } from '../core/logger.js';
+
+/** Max chars of upstream data to send to LLM. */
+const MAX_LLM_INPUT_CHARS = 50000;
+
+/**
+ * Sanitize + truncate upstream text for LLM consumption.
+ */
+function prepareForLLM(text: string): string {
+  let result = text.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '');
+  if (result.length > MAX_LLM_INPUT_CHARS) {
+    result = result.slice(0, MAX_LLM_INPUT_CHARS) + '\n...(truncated)';
+    logger.info('AggregatorAgent truncated upstream data', { original: text.length, truncated: result.length });
+  }
+  return result;
+}
 
 /**
  * AggregatorAgent — formats upstream artifacts into a user-facing summary.
@@ -22,9 +38,9 @@ export const AggregatorAgent: WorkerAgent = {
       return `## ${header}\n${body}`;
     });
 
-    const combinedContent = sections.join('\n\n');
+    const rawContent = sections.join('\n\n');
 
-    if (!combinedContent.trim()) {
+    if (!rawContent.trim() || rawContent.length < 10) {
       const { artifactId } = await ctx.artifacts.writeText({
         type: 'summary',
         title: node.title,
@@ -38,28 +54,48 @@ export const AggregatorAgent: WorkerAgent = {
       };
     }
 
-    const response = await complete({
-      model: node.model as 'fast' | 'balanced' | 'strong',
-      messages: [
-        {
-          role: 'system',
-          content: 'You are a formatting assistant. Synthesize the following sections into a clear, user-friendly markdown summary. Be concise and highlight the most important information.',
-        },
-        { role: 'user', content: combinedContent },
-      ],
-    });
+    const combinedContent = prepareForLLM(rawContent);
 
-    const { artifactId } = await ctx.artifacts.writeText({
-      type: 'summary',
-      title: node.title,
-      content: response.text,
-    });
+    try {
+      const response = await complete({
+        model: node.model as 'fast' | 'balanced' | 'strong',
+        messages: [
+          {
+            role: 'system',
+            content: 'You are a formatting assistant. Synthesize the following sections into a clear, user-friendly markdown summary. Be concise and highlight the most important information.',
+          },
+          { role: 'user', content: combinedContent },
+        ],
+      });
 
-    return {
-      status: 'completed',
-      output: { summary: response.text, artifactId },
-      artifactIds: [artifactId],
-      costTokens: response.usage.total_tokens,
-    };
+      const { artifactId } = await ctx.artifacts.writeText({
+        type: 'summary',
+        title: node.title,
+        content: response.text,
+      });
+
+      return {
+        status: 'completed',
+        output: { summary: response.text, artifactId },
+        artifactIds: [artifactId],
+        costTokens: response.usage.total_tokens,
+      };
+    } catch (err) {
+      logger.error('AggregatorAgent LLM call failed', { error: (err as Error).message, dataSize: combinedContent.length });
+
+      // Fallback: return truncated raw data
+      const fallback = 'Could not generate summary. Here is the raw data:\n' + combinedContent.slice(0, 5000);
+      const { artifactId } = await ctx.artifacts.writeText({
+        type: 'summary',
+        title: node.title,
+        content: fallback,
+      });
+      return {
+        status: 'completed',
+        output: { summary: fallback, artifactId },
+        artifactIds: [artifactId],
+        costTokens: 0,
+      };
+    }
   },
 };

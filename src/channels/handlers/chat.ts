@@ -1,5 +1,6 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
+import { complete } from '../../llm/provider.js';
 import { completeWithTools } from '../../llm/toolLoop.js';
 import type { Message, LLMToolDef } from '../../llm/provider.js';
 import { getSessionContext, storeTurn, needsCompaction } from '../../session/sessionManager.js';
@@ -10,7 +11,7 @@ import { incrementDailyTokens } from '../../db/dailyBudget.js';
 import { insertLedgerEntry } from '../../db/ledger.js';
 import { storeTextArtifact, storeFileArtifact } from '../../db/artifacts.js';
 import { getConfig } from '../../core/config.js';
-import { hasSecret, getSecret } from '../../core/secrets.js';
+import { getSecret, isGwsReady } from '../../core/secrets.js';
 import { getActiveSubAgents } from '../../db/subAgents.js';
 import { getAllTemplates } from '../../planner/templates.js';
 import { getAllTools } from '../../tools/sdk/registry.js';
@@ -25,9 +26,6 @@ export interface ChatContext {
   sendMessage: (text: string) => Promise<void>;
 }
 
-/**
- * Load a .clawlite/ file safely. Returns empty string on failure.
- */
 function loadClawliteFile(filename: string): string {
   try {
     return readFileSync(join(process.cwd(), '.clawlite', filename), 'utf-8').trim();
@@ -36,37 +34,105 @@ function loadClawliteFile(filename: string): string {
   }
 }
 
+// ============================================================
+// LIGHTWEIGHT CHAT — for simple conversational messages
+// No tools, no tool loop, short system prompt. ~200-500 tokens.
+// ============================================================
+
 /**
- * Get live sub-agent list from the database.
+ * Lightweight system prompt — ~200-300 tokens max.
+ * For simple chat only. No tool instructions, no architecture dump.
  */
+function buildLightSystemPrompt(memorySnippet: string): string {
+  let config: any;
+  try { config = getConfig(); } catch { config = {}; }
+  const name = config?.operator?.name ?? 'ClawLite';
+
+  const persona = loadClawliteFile('PERSONA.md');
+  const userProfile = loadClawliteFile('USER.md');
+
+  let prompt = persona || `You are ${name}, an AI operator assistant. Be helpful, concise, and direct.`;
+
+  if (userProfile) {
+    const truncated = userProfile.slice(0, 800);
+    prompt += `\n\nAbout your user:\n${truncated}`;
+  }
+
+  if (memorySnippet) {
+    prompt += `\n\n${memorySnippet}`;
+  }
+
+  prompt += `\n\nKeep responses concise. If the user asks you to DO something (take an action, check email, research, etc.), tell them you can do it and suggest the right command or just say "let me handle that" — the system will route action requests to the right workflow automatically.`;
+
+  return prompt;
+}
+
+/**
+ * LIGHTWEIGHT chat handler — for simple conversational messages.
+ * No tools, no tool loop, short system prompt. Target: ~200-500 tokens total.
+ */
+export async function handleChat(
+  text: string,
+  ctx: ChatContext,
+): Promise<void> {
+  const budgetCheck = checkDailyBudget(500);
+  if (!budgetCheck.ok) {
+    await ctx.sendMessage('Daily token budget exhausted. Resets in 24 hours.');
+    return;
+  }
+
+  const sessionTurns = getSessionContext(ctx.chatId, ctx.channelName);
+  const memories = await retrieveMemories(text, ['user_profile']);
+  const memorySnippet = memories.length > 0
+    ? 'Relevant memory:\n' + memories.map(m => `- ${m.content}`).join('\n')
+    : '';
+
+  const messages: Message[] = [
+    { role: 'system' as const, content: buildLightSystemPrompt(memorySnippet) },
+    ...sessionTurns.map(t => {
+      if (t.role === 'user') return { role: 'user' as const, content: t.content };
+      return { role: 'assistant' as const, content: t.content };
+    }),
+    { role: 'user' as const, content: text },
+  ];
+
+  try {
+    // Direct LLM call — NO tools, NO tool loop
+    const result = await complete({
+      model: 'fast',
+      messages,
+    });
+
+    incrementDailyTokens(result.usage.total_tokens);
+    storeTurn(ctx.chatId, ctx.channelName, 'assistant', result.text);
+
+    if (needsCompaction(ctx.chatId, ctx.channelName)) {
+      await compactSession(ctx.chatId, ctx.channelName);
+    }
+
+    await ctx.sendMessage(result.text);
+  } catch (err) {
+    logger.error('Lightweight chat failed', { error: (err as Error).message });
+    await ctx.sendMessage('Something went wrong. Try again.');
+  }
+}
+
+
+// ============================================================
+// TOOL-CAPABLE CHAT — used by complex handler fallback ONLY
+// Full system prompt + tools + ReAct loop. Expensive path.
+// ============================================================
+
 function getSubAgentSummary(): string {
   try {
     const agents = getActiveSubAgents();
-    if (!agents || agents.length === 0) return 'No sub-agents configured.';
-    return agents.map((a: any) => `- **${a.name}**: ${a.description ?? a.role ?? 'No description'}`).join('\n');
+    if (!agents || agents.length === 0) return 'None configured.';
+    return agents.map((a: any) => `- ${a.name}: ${a.description ?? a.role ?? 'No description'}`).join('\n');
   } catch {
-    return 'Sub-agent info unavailable.';
+    return 'Unavailable.';
   }
 }
 
-/**
- * Get live template list.
- */
-function getTemplateSummary(): string {
-  try {
-    const templates = getAllTemplates();
-    if (!templates || templates.length === 0) return 'No templates loaded.';
-    return templates.map((t: any) =>
-      `- **${t.name}**${t.slashCommand ? ` (${t.slashCommand})` : ''}: ${t.description}`
-    ).join('\n');
-  } catch {
-    return 'Template info unavailable.';
-  }
-}
-
-/**
- * Build LLM tool definitions from the tool registry.
- */
 function buildLLMToolDefs(): LLMToolDef[] {
   try {
     const tools = getAllTools();
@@ -75,7 +141,7 @@ function buildLLMToolDefs(): LLMToolDef[] {
       function: {
         name: t.name,
         description: t.description,
-        parameters: zodToJsonSchema(t.schema),
+        parameters: t.jsonSchema ?? zodToJsonSchema(t.schema),
       },
     }));
   } catch {
@@ -83,9 +149,6 @@ function buildLLMToolDefs(): LLMToolDef[] {
   }
 }
 
-/**
- * Build a lightweight ToolContext for chat-mode tool execution.
- */
 function buildChatToolContext(chatId: string, channelName: string, sendMessage: (text: string) => Promise<void>): ToolContext {
   let config: any;
   try {
@@ -130,10 +193,15 @@ function buildChatToolContext(chatId: string, channelName: string, sendMessage: 
     },
     approvals: {
       request: async (payload) => {
-        // For chat-mode approvals, notify user and proceed
-        // Full approval flow would pause here; for now we notify and auto-approve
-        await sendMessage(`**Approval needed:** ${payload.title}\n${payload.preview}\n\n_Proceeding automatically for chat mode._`);
-        return { approvalId: `chat_approval_${Date.now()}` };
+        // Show the approval request to the user
+        await sendMessage(
+          `**Approval Required**\n` +
+          `Action: ${payload.title}\n\n` +
+          `${payload.preview}\n\n` +
+          `Reply **yes** to approve, **no** to cancel.`
+        );
+        // Halt the tool loop — user must re-request after approving
+        throw new Error('APPROVAL_PENDING:' + payload.title);
       },
     },
     artifacts: {
@@ -162,148 +230,59 @@ function buildChatToolContext(chatId: string, channelName: string, sendMessage: 
 }
 
 /**
- * Build the complete system prompt with full self-awareness.
+ * Compact system prompt for tool-capable chat. ~200-400 tokens.
  */
-function buildSystemPrompt(memoryContext: string): string {
+function buildToolSystemPrompt(memoryContext: string): string {
   let config: any;
-  try {
-    config = getConfig();
-  } catch {
-    config = {};
-  }
+  try { config = getConfig(); } catch { config = {}; }
   const operatorName = config?.operator?.name ?? 'ClawLite';
 
-  // Load persona and user profile
-  const persona = loadClawliteFile('PERSONA.md') || `You are ${operatorName}, an AI operator assistant.`;
+  const persona = loadClawliteFile('PERSONA.md') || `You are ${operatorName}, an AI operator.`;
   const userProfile = loadClawliteFile('USER.md');
-  const heartbeat = loadClawliteFile('HEARTBEAT.md');
 
-  // Build config awareness
   const tiers = config?.llm?.tiers as Record<string, string> | undefined;
   const channels = config?.channels as Record<string, any> | undefined;
   const budgets = config?.budgets;
-  const hardLimits = config?.hardLimits;
-  const research = config?.research;
 
   const enabledChannels = channels
     ? Object.entries(channels).filter(([, c]) => c?.enabled).map(([n]) => n)
     : [];
 
-  const gwsReady = hasSecret('GWS_CREDENTIALS_PATH');
-  const hasOpenRouterKey = hasSecret('OPENROUTER_API_KEY');
+  const gwsReady = isGwsReady();
 
   const parts: string[] = [];
 
-  // === IDENTITY ===
   parts.push(persona);
 
-  // === OWNER ===
   if (userProfile) {
-    parts.push(`\n## About Your Owner\n${userProfile}`);
+    const truncated = userProfile.slice(0, 800);
+    parts.push(`\nAbout your user:\n${truncated}`);
   }
 
-  // === SYSTEM SELF-KNOWLEDGE ===
+  // Compact system knowledge
   parts.push(`
-## What You Are — System Self-Knowledge
+## System
+You are ${operatorName} running on ClawLite. Provider: ${config?.llm?.provider ?? 'unknown'}.
+Models: fast=${tiers?.fast ?? '?'}, balanced=${tiers?.balanced ?? '?'}, strong=${tiers?.strong ?? '?'}.
+Channels: ${enabledChannels.join(', ') || 'none'}.
+${gwsReady
+  ? '- Google Workspace: Connected (Gmail, Calendar, Drive).'
+  : '- Google Workspace: NOT connected. When the user asks about email/calendar/drive, use the gws_connect tool to set it up — it will install the CLI if needed and open the browser for authorization. Do NOT tell the user to use the terminal.'}
+Budget: ${budgets?.dailyTokens?.toLocaleString() ?? '?'} tokens/day.
 
-You are ${operatorName}, an AI operator built on **ClawLite** — a local-first AI operator platform. You are NOT a generic chatbot. You are a real, running software system with tools, memory, sub-agents, and workflow execution.
+Sub-agents: ${getSubAgentSummary()}
 
-### Architecture
-- You run as a single Node.js process with a SQLite database
-- You connect to messaging channels (${enabledChannels.join(', ') || 'none configured'}) and respond to your owner
-- You process messages through a 3-path router: simple chat (lightweight), slash commands (direct), or complex workflows (multi-step DAG execution)
-- You have persistent memory (FTS5 full-text search), session history, and a ledger tracking all actions
-- You execute multi-step tasks as parallel DAGs (Directed Acyclic Graphs) using a task graph engine with circuit breakers and safety controls
+Available commands: /inbox, /today, /draft, /research, /status, /budget, /agents, /tools, /remember, /forget, /heartbeat, /help
 
-### Your LLM Configuration
-- Provider: **${config?.llm?.provider ?? 'unknown'}** (API-based, not running locally)${tiers ? `
-- Fast tier: **${tiers.fast}** — used for conversations, routing, quick tasks
-- Balanced tier: **${tiers.balanced}** — used for drafting, summarization, planning
-- Strong tier: **${tiers.strong}** — used for complex reasoning, code generation` : ''}
-- Right now in this conversation, you are using the **fast tier** model${tiers?.fast ? ` (${tiers.fast})` : ''}
+## Behavior
+- Execute actions using your tools when asked. Don't describe steps — do them.
+- Be concise. Short answers for simple questions, detailed only when needed.
+- If you can't do something, say what's missing and how to fix it.
+- Use the config tool for config/model changes. Use workspace for email/calendar. Use research for web lookups.
+- You have a shell tool. If you need to copy files, create directories, install packages, or run CLI commands, use it. NEVER tell the user to open a terminal or run commands themselves.
+- If Google Workspace isn't connected, use the gws_connect tool. If that needs a client_secret.json file, ask the user where it is, then use the shell tool to copy it to ~/.config/gws/client_secret.json, then call gws_connect again.
+- When the gws_connect tool returns a URL, present it to the user as a clickable link. Say something like "Click here to authorize: [URL]". Never tell the user to check their browser — always provide the link directly in chat.`);
 
-### Channels & Connectivity
-${enabledChannels.map(ch => `- **${ch}**: enabled and active`).join('\n') || '- No channels configured'}
-${gwsReady ? '- **Google Workspace**: Credentials configured. Gmail, Calendar, and Drive are connected via the gws CLI tool.' : '- **Google Workspace**: Not yet configured.'}
-${hasOpenRouterKey ? '- **OpenRouter API**: Connected' : ''}${research ? `
-- **Research**: ${research.provider ?? 'openrouter'} with models basic=${research.models?.basic ?? 'unknown'}, deep=${research.models?.deep ?? 'unknown'}` : ''}
-
-### Budget & Limits${budgets ? `
-- Daily token budget: **${budgets.dailyTokens?.toLocaleString() ?? 'unknown'}** tokens
-- Per-job token limit: **${budgets.perJobTokens?.toLocaleString() ?? 'unknown'}** tokens
-- Max tool calls per job: **${budgets.maxToolCallsPerJob ?? 'unknown'}**` : ''}${hardLimits ? `
-- Max nodes per job: ${hardLimits.maxNodesPerJob}, Max LLM calls: ${hardLimits.maxTotalLLMCalls}
-- Agentic fallback limits: ${hardLimits.agenticMaxIterations} iterations, ${hardLimits.agenticMaxNodes} nodes, ${hardLimits.agenticMaxTokenBudget?.toLocaleString()} tokens` : ''}
-
-### Your Sub-Agents
-You delegate work to specialized sub-agents. Each handles a specific domain:
-${getSubAgentSummary()}
-
-### Your Workflow Templates
-These are pre-built multi-step workflows you can execute:
-${getTemplateSummary()}
-
-### Your Memory System
-- You have persistent memory stored in SQLite with FTS5 full-text search
-- Memories are tagged (user_profile, episodic, fact) and retrieved based on relevance
-- Session history tracks conversations per chat per channel
-- Old sessions are automatically compacted into episodic memories
-- Users can save facts with /remember and remove with /forget
-
-### Your File System
-You manage these files in the .clawlite/ directory:
-- **config.json** — All configuration (channels, models, budgets, limits)
-- **.env** — API keys and secrets (OPENROUTER_API_KEY, GWS_CREDENTIALS_PATH, etc.)
-- **PERSONA.md** — Your personality and behavior instructions
-- **USER.md** — Your owner's profile and preferences
-- **HEARTBEAT.md** — Proactive checks you run periodically
-- **templates/** — Custom workflow templates (YAML)
-- **workspace/** — Sandboxed working directory for file operations
-- **clawlite.db** — SQLite database (jobs, nodes, memory, sessions, ledger, etc.)${heartbeat ? `
-
-### Your Heartbeat Checks
-You periodically check these conditions and take action if needed:
-${heartbeat}` : ''}`);
-
-  // === COMMANDS ===
-  parts.push(`
-## Available Commands
-When the user wants to do something, guide them to the right command:
-
-**Workflows:** /inbox, /today, /draft, /research <topic>, /deepresearch <topic>, /publish, /build, /schedule, /send
-**System:** /status, /budget, /agents, /tools, /templates, /jobs, /help
-**Memory:** /remember <fact>, /forget <fact>, /profile
-**Heartbeat:** /heartbeat list/add/remove/now
-
-Or the user can just describe what they want naturally and you'll route it to the right workflow automatically.`);
-
-  // === CONFIG MANAGEMENT ===
-  parts.push(`
-## Configuration Management
-Your configuration lives in \`.clawlite/config.json\`. You have the **config** tool to read and modify it directly:
-- Use the **config** tool with action \`config.get\` to read any config value (dot notation, e.g. \`llm.tiers.fast\`)
-- Use the **config** tool with action \`config.set\` to change any config value
-- Use the **config** tool with action \`config.show\` to show the full config
-- Use the **config** tool with action \`secret.set\` to add/update API keys in .env
-- Use the **config** tool with action \`secret.list\` to list configured secret keys
-- Model IDs follow the OpenRouter format: \`provider/model-name\` (e.g., \`x-ai/grok-4.1-fast\`, \`anthropic/claude-sonnet-4-20250514\`, \`openai/gpt-4o\`)
-- After config changes that affect runtime behavior, the user should restart you with \`clawlite start\`.`);
-
-  // === BEHAVIORAL RULES ===
-  parts.push(`
-## How To Respond
-- You are a self-aware, intelligent operator. You know your own architecture, config, tools, agents, and state.
-- Answer questions about yourself accurately using the system knowledge above. Never say "I don't know" about your own system — you KNOW it.
-- **You have tools available. When the user asks you to DO something (check email, change config, research a topic, read/write files), USE your tools to execute the action directly.** Do not just tell the user what to do — actually do it.
-- For risky actions (sending email, changing config, managing secrets), the approval system will prompt the user automatically. You don't need to ask — just call the tool.
-- Only fall back to suggesting CLI commands if the action is truly outside your tool capabilities (e.g., restarting the process, installing packages).
-- NEVER say "I can't do that" without offering a concrete alternative. You always know HOW things can be done in your system.
-- NEVER give generic chatbot responses. You are ${operatorName}. You have a specific personality, specific tools, specific capabilities. Be specific.
-- When discussing competitors (like OpenClaw), stay in character per your persona.
-- Be concise but thorough. If the user asks a technical question about your system, give a real answer.
-- If the user describes a complex multi-step task (not a slash command), it will be automatically routed to the right workflow. Let them know this.`);
-
-  // === MEMORY CONTEXT ===
   if (memoryContext) {
     parts.push(memoryContext);
   }
@@ -312,41 +291,32 @@ Your configuration lives in \`.clawlite/config.json\`. You have the **config** t
 }
 
 /**
- * Chat handler with inline tool execution.
- * Uses fast-tier LLM with session context + memory + tool-calling loop.
+ * TOOL-CAPABLE chat handler — for messages that didn't match a template.
+ * Has full tool access, ReAct loop. Called by complex handler fallback only.
  */
-export async function handleChat(
+export async function handleToolChat(
   text: string,
   ctx: ChatContext,
 ): Promise<void> {
-  // Budget check
   const budgetCheck = checkDailyBudget(500);
   if (!budgetCheck.ok) {
     await ctx.sendMessage('Daily token budget exhausted. Resets in 24 hours.');
     return;
   }
 
-  // Get session context (last N turns)
   const sessionTurns = getSessionContext(ctx.chatId, ctx.channelName);
-
-  // Get relevant memories
   const memories = await retrieveMemories(text, ['user_profile']);
 
-  // Build memory context
   let memoryContext = '';
   if (memories.length > 0) {
     memoryContext = '\n\n## Memory\n' + memories.map(m => `- ${m.content}`).join('\n');
   }
 
-  // Build LLM tool definitions from registry
   const llmTools = buildLLMToolDefs();
-
-  // Build tool context for invokeTool
   const toolCtx = buildChatToolContext(ctx.chatId, ctx.channelName, ctx.sendMessage);
 
-  // Build message history
   const messages: Message[] = [
-    { role: 'system' as const, content: buildSystemPrompt(memoryContext) },
+    { role: 'system' as const, content: buildToolSystemPrompt(memoryContext) },
     ...sessionTurns.map(t => {
       if (t.role === 'user') return { role: 'user' as const, content: t.content };
       return { role: 'assistant' as const, content: t.content };
@@ -356,41 +326,42 @@ export async function handleChat(
 
   try {
     let config: any;
-    try {
-      config = getConfig();
-    } catch {
-      config = {};
-    }
+    try { config = getConfig(); } catch { config = {}; }
 
     const result = await completeWithTools({
       model: 'fast',
       messages,
       tools: llmTools,
       toolExecutor: async (name: string, argsJson: string) => {
-        const args = JSON.parse(argsJson);
+        let args: Record<string, unknown>;
+        try {
+          args = JSON.parse(argsJson);
+        } catch {
+          logger.warn('Tool args JSON parse failed, using empty object', { tool: name, raw: argsJson });
+          args = {};
+        }
+
+        logger.debug('LLM tool args', { tool: name, args });
+
         return invokeTool(name, args, toolCtx);
       },
-      maxIterations: config?.hardLimits?.agenticMaxIterations ?? 5,
+      maxIterations: 3,
       maxTokens: config?.budgets?.perJobTokens ?? 50000,
       onToolCall: (name: string) => {
         logger.info('Chat tool call', { tool: name, chatId: ctx.chatId });
       },
     });
 
-    // Record token usage
     incrementDailyTokens(result.totalTokens);
-
-    // Store assistant turn in session
     storeTurn(ctx.chatId, ctx.channelName, 'assistant', result.text);
 
-    // Compact session if needed
     if (needsCompaction(ctx.chatId, ctx.channelName)) {
       await compactSession(ctx.chatId, ctx.channelName);
     }
 
     await ctx.sendMessage(result.text);
   } catch (err) {
-    logger.error('Chat handler failed', { error: (err as Error).message });
+    logger.error('Tool chat failed', { error: (err as Error).message });
     await ctx.sendMessage('Something went wrong. Please try again.');
   }
 }

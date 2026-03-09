@@ -72,7 +72,6 @@ async function scanDirectory(dir: string): Promise<void> {
         const val = mod[key];
         if (val && typeof val === 'object' && 'name' in val && 'handler' in val && 'schema' in val) {
           registerTool(val as ToolDefinition);
-          break;
         }
       }
     } catch (err) {

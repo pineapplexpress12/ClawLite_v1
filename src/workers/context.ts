@@ -76,7 +76,7 @@ export function buildToolContext(job: JobRow, node: NodeRow): ToolContext {
           nodeId: node.id,
           type: params.type,
           title: params.title,
-          filePath: params.path,
+          path: params.path,
           fileSize: params.bytes.length,
           mimeType: 'application/octet-stream',
         });

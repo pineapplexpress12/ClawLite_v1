@@ -12,38 +12,62 @@ function convertNode(schema: z.ZodTypeAny): Record<string, unknown> {
   const def = (schema as any)._def;
   const typeName = def?.typeName as string;
 
+  let result: Record<string, unknown>;
+
   switch (typeName) {
     case 'ZodObject':
-      return convertObject(def);
+      result = convertObject(def);
+      break;
     case 'ZodString':
-      return convertString(def);
+      result = convertString(def);
+      break;
     case 'ZodNumber':
-      return { type: 'number' };
+      result = { type: 'number' };
+      break;
     case 'ZodBoolean':
-      return { type: 'boolean' };
+      result = { type: 'boolean' };
+      break;
     case 'ZodEnum':
-      return { type: 'string', enum: def.values };
+      result = { type: 'string', enum: def.values };
+      break;
     case 'ZodArray':
-      return { type: 'array', items: convertNode(def.type) };
+      result = { type: 'array', items: convertNode(def.type) };
+      break;
     case 'ZodOptional':
-      return convertNode(def.innerType);
+      result = convertNode(def.innerType);
+      break;
     case 'ZodDefault':
-      return { ...convertNode(def.innerType), default: def.defaultValue() };
+      result = { ...convertNode(def.innerType), default: def.defaultValue() };
+      break;
     case 'ZodRecord':
-      return { type: 'object', additionalProperties: convertNode(def.valueType) };
+      result = { type: 'object', additionalProperties: convertNode(def.valueType) };
+      break;
     case 'ZodUnion':
-      return { anyOf: (def.options as z.ZodTypeAny[]).map(convertNode) };
+      result = { anyOf: (def.options as z.ZodTypeAny[]).map(convertNode) };
+      break;
     case 'ZodLiteral':
-      return { type: typeof def.value, const: def.value };
+      result = { type: typeof def.value, const: def.value };
+      break;
     case 'ZodNullable':
-      return { ...convertNode(def.innerType), nullable: true };
+      result = { ...convertNode(def.innerType), nullable: true };
+      break;
     case 'ZodAny':
-      return {};
+      result = {};
+      break;
     case 'ZodUnknown':
-      return {};
+      result = {};
+      break;
     default:
-      return {};
+      result = {};
+      break;
   }
+
+  // Attach description if present (from .describe())
+  if (def?.description && !result.description) {
+    result.description = def.description;
+  }
+
+  return result;
 }
 
 function convertObject(def: any): Record<string, unknown> {

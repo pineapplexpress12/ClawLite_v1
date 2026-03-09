@@ -16,6 +16,7 @@ export interface ToolDefinition<TParams extends z.ZodTypeAny = z.ZodTypeAny> {
   risk: ToolRisk;
   requiredSecrets: RequiredSecret[];
   schema: TParams;
+  jsonSchema?: Record<string, unknown>;
   handler: (params: z.infer<TParams>, ctx: ToolContext) => Promise<unknown>;
   mockHandler?: (params: z.infer<TParams>, ctx: ToolContext) => Promise<unknown>;
 }

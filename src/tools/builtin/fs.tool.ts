@@ -40,6 +40,26 @@ export const FsTool: ToolDefinition<typeof schema> = {
   requiredSecrets: [],
   schema,
 
+  jsonSchema: {
+    type: 'object',
+    properties: {
+      action: {
+        type: 'string',
+        enum: ['readText', 'writeText', 'listDir'],
+        description: 'Filesystem action to perform',
+      },
+      path: {
+        type: 'string',
+        description: 'File or directory path relative to .clawlite/workspace/',
+      },
+      content: {
+        type: 'string',
+        description: 'Content to write (required for writeText action)',
+      },
+    },
+    required: ['action', 'path'],
+  },
+
   async handler(params) {
     const safePath = resolveSafePath(params.path);
 

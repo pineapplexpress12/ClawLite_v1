@@ -5,7 +5,8 @@ import { getConfig } from '../core/config.js';
 import { logger } from '../core/logger.js';
 import { registerWebhookRoutes } from './webhooks.js';
 import { registerArtifactRoutes } from './artifacts.js';
-import { registerStatusRoutes } from './status.js';
+import { registerStatusRoutes, getSystemStatus } from './status.js';
+import { storeFileArtifact } from '../db/artifacts.js';
 import type { InboundMessage, OutboundMessage } from '../channels/types.js';
 
 let fastifyInstance: ReturnType<typeof Fastify> | null = null;
@@ -58,6 +59,13 @@ export async function startHTTPServer(): Promise<ReturnType<typeof Fastify>> {
               userId: msg.userId ?? chatId,
               text: msg.text ?? '',
             });
+          } else if (msg.type === 'request_status') {
+            try {
+              const status = getSystemStatus();
+              socket.send(JSON.stringify({ type: 'status_update', ...status }));
+            } catch (err) {
+              logger.error('Failed to get system status', { error: (err as Error).message });
+            }
           }
         } catch (err) {
           logger.error('WebChat message parse error', { error: (err as Error).message });
@@ -69,6 +77,35 @@ export async function startHTTPServer(): Promise<ReturnType<typeof Fastify>> {
       });
     });
   }
+
+  // File upload endpoint for webchat
+  fastify.post('/upload', async (req, reply) => {
+    try {
+      const file = await req.file();
+      if (!file) {
+        return reply.status(400).send({ error: 'No file uploaded' });
+      }
+
+      const chunks: Buffer[] = [];
+      for await (const chunk of file.file) {
+        chunks.push(chunk);
+      }
+      const buffer = Buffer.concat(chunks);
+
+      const artifactId = storeFileArtifact({
+        type: `upload_${file.mimetype?.split('/')[0] || 'document'}`,
+        title: file.filename || `upload_${Date.now()}`,
+        path: '',
+        fileSize: buffer.length,
+        mimeType: file.mimetype || 'application/octet-stream',
+      });
+
+      return reply.send({ artifactId, filename: file.filename, size: buffer.length });
+    } catch (err) {
+      logger.error('File upload failed', { error: (err as Error).message });
+      return reply.status(500).send({ error: 'Upload failed' });
+    }
+  });
 
   // Register route modules
   registerWebhookRoutes(fastify);

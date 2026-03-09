@@ -11,6 +11,19 @@ import { loadSecrets } from './core/secrets.js';
 import { seedDefaultSubAgents } from './db/subAgents.js';
 import { handleInboundMessage } from './channels/handlers/message.js';
 import { isAuthorized } from './channels/shared/auth.js';
+import { autoDiscoverTools, getAllTools } from './tools/sdk/registry.js';
+import { getAllTemplates } from './planner/templates.js';
+import { complete } from './llm/provider.js';
+import { setWorkerExecutor } from './executor/runNode.js';
+import { registerWorker, findWorkerForNodeType } from './workers/registry.js';
+import { getNode } from './db/nodes.js';
+import { getJob } from './db/jobs.js';
+import { buildToolContext } from './workers/context.js';
+import { WorkspaceAgent } from './workers/WorkspaceAgent.js';
+import { ResearchAgent } from './workers/ResearchAgent.js';
+import { PublisherAgent } from './workers/PublisherAgent.js';
+import { AggregatorAgent } from './workers/AggregatorAgent.js';
+import { BuilderAgent } from './workers/BuilderAgent.js';
 
 /**
  * Main entry point — starts ClawLite in the correct order.
@@ -28,6 +41,48 @@ export async function startClawLite(): Promise<void> {
   runMigrations(db);
   seedDefaultSubAgents();
   logger.info('Database initialized');
+
+  // 2b. Discover and register tools
+  await autoDiscoverTools();
+  const tools = getAllTools();
+  logger.info('Tools registered', { count: tools.length, names: tools.map(t => t.name) });
+
+  // 2c. Check templates
+  const templates = getAllTemplates();
+  if (templates.length === 0) {
+    logger.warn('No templates loaded — check planner/templates.ts');
+  } else {
+    logger.info('Templates loaded', { count: templates.length });
+  }
+
+  // 2d. Register worker agents
+  registerWorker(WorkspaceAgent);
+  registerWorker(ResearchAgent);
+  registerWorker(PublisherAgent);
+  registerWorker(AggregatorAgent);
+  registerWorker(BuilderAgent);
+  logger.info('Workers registered', {
+    count: 5,
+    names: ['WorkspaceAgent', 'ResearchAgent', 'PublisherAgent', 'AggregatorAgent', 'BuilderAgent'],
+  });
+
+  // 2e. Wire worker executor so template jobs can actually run
+  setWorkerExecutor(async (nodeId, jobId) => {
+    const node = getNode(nodeId);
+    const job = getJob(jobId);
+    if (!node || !job) throw new Error(`Node or job not found: ${nodeId}`);
+
+    const worker = findWorkerForNodeType(node.type);
+    if (!worker) throw new Error(`No worker for node type: ${node.type}`);
+
+    const toolCtx = buildToolContext(job, node);
+    const result = await worker.execute(node, toolCtx);
+    return {
+      output: (result.output ?? {}) as Record<string, unknown>,
+      costTokens: result.costTokens,
+    };
+  });
+  logger.info('Worker executor wired');
 
   // 3. Start HTTP server (registers WebSocket route before listen)
   if (config.http.enabled) {
@@ -61,6 +116,9 @@ export async function startClawLite(): Promise<void> {
 
   logger.info('Recovery complete. Ready.');
 
+  // 7. Startup self-test (non-blocking)
+  selfTest(config).catch(() => {});
+
   // Graceful shutdown handlers
   process.on('SIGINT', async () => {
     await gracefulShutdown();
@@ -70,4 +128,34 @@ export async function startClawLite(): Promise<void> {
     await gracefulShutdown();
     process.exit(0);
   });
+}
+
+async function selfTest(config: any): Promise<void> {
+  // Check LLM connectivity
+  try {
+    const response = await complete({
+      model: 'fast',
+      messages: [{ role: 'user', content: 'Reply with OK' }],
+    });
+    logger.info('LLM self-test passed', {
+      model: config.llm.tiers.fast,
+      tokens: response.usage.total_tokens,
+    });
+  } catch (err) {
+    logger.error('LLM self-test FAILED — check your API key and model config', {
+      error: (err as Error).message,
+    });
+  }
+
+  // Check tools loaded
+  const tools = getAllTools();
+  if (tools.length === 0) {
+    logger.error('No tools loaded — check tools/builtin/ directory');
+  }
+
+  // Check templates loaded
+  const templates = getAllTemplates();
+  if (templates.length === 0) {
+    logger.error('No templates loaded — check planner/templates.ts');
+  }
 }

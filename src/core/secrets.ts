@@ -131,6 +131,39 @@ export function listSecretKeys(): string[] {
 }
 
 /**
+ * Check if Google Workspace is actually connected.
+ * Checks GWS_CREDENTIALS_PATH, ~/.config/gws/credentials.json, and credentials.enc.
+ * gws 0.8+ uses encrypted storage (credentials.enc) by default.
+ */
+export function isGwsReady(): boolean {
+  // Check 1: GWS_CREDENTIALS_PATH env var points to a real file
+  try {
+    const credPath = getSecret('GWS_CREDENTIALS_PATH');
+    if (credPath && existsSync(credPath)) {
+      return true;
+    }
+  } catch {
+    // secret accessor may not be initialized
+  }
+
+  // Check 2: gws CLI has auth credentials in ~/.config/gws/
+  try {
+    const homeDir = process.env.HOME || process.env.USERPROFILE || '';
+    const gwsConfigDir = `${homeDir}/.config/gws`;
+    if (existsSync(gwsConfigDir)) {
+      // gws 0.8+ stores encrypted credentials
+      if (existsSync(`${gwsConfigDir}/credentials.enc`)) return true;
+      // Older versions use plain JSON
+      if (existsSync(`${gwsConfigDir}/credentials.json`)) return true;
+    }
+  } catch {
+    // leave as false
+  }
+
+  return false;
+}
+
+/**
  * Create a secrets accessor for tool contexts.
  */
 export function createSecretsAccessor(): { get: (key: string) => string | undefined; has: (key: string) => boolean } {

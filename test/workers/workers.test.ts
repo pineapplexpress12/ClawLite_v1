@@ -21,6 +21,22 @@ vi.mock('../../src/llm/provider.js', () => ({
   complete: vi.fn(),
 }));
 
+// Mock workspace tool handler for WorkspaceAgent direct calls
+const mockWorkspaceHandler = vi.fn();
+
+vi.mock('../../src/tools/sdk/registry.js', async (importOriginal) => {
+  const actual = await importOriginal() as Record<string, unknown>;
+  return {
+    ...actual,
+    getTool: (name: string) => {
+      if (name === 'workspace') {
+        return { handler: mockWorkspaceHandler };
+      }
+      return (actual.getTool as (n: string) => unknown)?.(name);
+    },
+  };
+});
+
 import { createJob, getJob } from '../../src/db/jobs.js';
 import { createNode, getNode } from '../../src/db/nodes.js';
 import { storeTextArtifact, getArtifactsByNodeIds } from '../../src/db/artifacts.js';
@@ -187,15 +203,31 @@ describe('Phase 6: Workers', () => {
 
   // === WORKSPACE AGENT ===
   describe('WorkspaceAgent', () => {
-    it('should handle gmail.list (data retrieval, no LLM)', async () => {
+    it('should handle gmail.list (list-then-fetch, no LLM)', async () => {
       const { node, ctx } = makeJobAndNode('gmail.list', 'WorkspaceAgent', {
         input: { maxResults: 20 },
+      });
+
+      // Mock 1: list call returns message IDs
+      mockWorkspaceHandler.mockResolvedValueOnce({
+        data: [{ messages: [{ id: 'msg1', threadId: 't1' }], resultSizeEstimate: 1 }],
+      });
+
+      // Mock 2: get call for msg1 returns metadata message
+      mockWorkspaceHandler.mockResolvedValueOnce({
+        data: [{ id: 'msg1', threadId: 't1', snippet: 'Hello there', labelIds: ['INBOX', 'UNREAD'], payload: { headers: [
+          { name: 'From', value: 'alice@example.com' },
+          { name: 'To', value: 'user@example.com' },
+          { name: 'Subject', value: 'Hello' },
+          { name: 'Date', value: 'Mon, 1 Jan 2024 00:00:00 +0000' },
+        ] } }],
       });
 
       const result = await WorkspaceAgent.execute(node, ctx);
       expect(result.status).toBe('completed');
       expect(result.costTokens).toBe(0);
       expect(result.artifactIds).toHaveLength(1);
+      expect((result.output as Record<string, unknown>).count).toBe(1);
     });
 
     it('should handle gmail.summarize with LLM', async () => {
@@ -220,15 +252,21 @@ describe('Phase 6: Workers', () => {
       expect(result.costTokens).toBe(60);
     });
 
-    it('should request approval for gmail.send', async () => {
+    it('should send email via gmail.send', async () => {
       const { node, ctx } = makeJobAndNode('gmail.send', 'WorkspaceAgent', {
-        input: { draftId: 'd1' },
-        requiresApproval: true,
+        input: { to: 'bob@example.com', subject: 'Test', body: 'Hello Bob, this is a test email.' },
+      });
+
+      // Mock workspace tool handler for send
+      mockWorkspaceHandler.mockResolvedValueOnce({
+        data: [{ id: 'sent1', threadId: 't1', labelIds: ['SENT'] }],
       });
 
       const result = await WorkspaceAgent.execute(node, ctx);
-      expect(result.status).toBe('waiting_approval');
-      expect(result.approvalId).toBeDefined();
+      expect(result.status).toBe('completed');
+      expect((result.output as any).sent).toBe(true);
+      expect((result.output as any).to).toBe('bob@example.com');
+      expect(result.artifactIds).toHaveLength(1);
     });
   });
 

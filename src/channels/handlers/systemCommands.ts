@@ -1,10 +1,13 @@
-import { getRecentJobs, getJob } from '../../db/jobs.js';
+import { existsSync } from 'node:fs';
+import { getRecentJobs, getJob, getJobsByStatus } from '../../db/jobs.js';
 import { getNodesByJobId } from '../../db/nodes.js';
 import { getDailyBudget } from '../../db/dailyBudget.js';
 import { getActiveSubAgents } from '../../db/subAgents.js';
-import { listTools } from '../../tools/sdk/registry.js';
+import { listTools, getAllTools } from '../../tools/sdk/registry.js';
 import { getAllTemplates } from '../../planner/templates.js';
 import { getConfig } from '../../core/config.js';
+import { getSecret, isGwsReady } from '../../core/secrets.js';
+import { isHeartbeatRunning } from '../../heartbeat/scheduler.js';
 import type { CommandContext } from './commands.js';
 
 /**
@@ -20,13 +23,48 @@ export async function handleSystemCommand(
     case '/status': {
       const config = getConfig();
       const budget = getDailyBudget();
-      const jobs = getRecentJobs(5);
+      const dailyLimit = config.budgets?.dailyTokens ?? 200000;
+      const remaining = dailyLimit - budget.tokens_consumed;
+      const pct = Math.round((budget.tokens_consumed / dailyLimit) * 100);
       const agents = getActiveSubAgents();
-      const remaining = config.budgets.dailyTokens - budget.tokens_consumed;
+      const tools = getAllTools();
+      const activeJobs = getJobsByStatus(['running', 'waiting_approval']);
+      const recentJobs = getRecentJobs(5);
 
-      await ctx.sendMessage(
-        `*Status*\nBudget: ${remaining.toLocaleString()} tokens remaining\nActive agents: ${agents.length}\nRecent jobs: ${jobs.length}`,
-      );
+      const gwsConnected = isGwsReady();
+
+      const operatorName = config.operator?.name ?? 'ClawLite';
+      const provider = config.llm?.provider ?? 'unknown';
+      const fast = config.llm?.tiers?.fast ?? '?';
+      const balanced = config.llm?.tiers?.balanced ?? '?';
+
+      const lines: string[] = [
+        `**Status**`,
+        ``,
+        `**Operator:** ${operatorName}`,
+        `**Provider:** ${provider}`,
+        `**Models:** fast=${fast}, balanced=${balanced}`,
+        `**GWS:** ${gwsConnected ? 'Connected' : 'Not connected'}`,
+        ``,
+        `**Budget:** ${budget.tokens_consumed.toLocaleString()} / ${dailyLimit.toLocaleString()} tokens (${pct}%)`,
+        `**Remaining:** ${remaining.toLocaleString()} tokens`,
+        ``,
+        `**Active jobs:** ${activeJobs.length}`,
+        `**Sub-agents:** ${agents.length} (${agents.map(a => a.name).join(', ')})`,
+        `**Tools:** ${tools.length} (${tools.map(t => t.name).join(', ')})`,
+        `**Heartbeat:** ${isHeartbeatRunning() ? `Running (every ${config.heartbeat?.intervalMinutes ?? 30}m)` : 'Stopped'}`,
+      ];
+
+      if (recentJobs.length > 0) {
+        lines.push('', '**Recent jobs:**');
+        for (const j of recentJobs) {
+          const icon = j.status === 'completed' ? '\u2705' : j.status === 'running' ? '\u2699\uFE0F' :
+                       j.status === 'failed' ? '\u274C' : j.status === 'waiting_approval' ? '\u23F3' : '\u2022';
+          lines.push(`${icon} ${j.goal.slice(0, 50)} (${j.status})`);
+        }
+      }
+
+      await ctx.sendMessage(lines.join('\n'));
       return true;
     }
 
@@ -85,13 +123,13 @@ export async function handleSystemCommand(
     }
 
     case '/tools': {
-      const tools = listTools();
-      if (tools.length === 0) {
+      const toolList = listTools();
+      if (toolList.length === 0) {
         await ctx.sendMessage('No tools registered.');
         return true;
       }
-      const lines = tools.map(t => `- ${t.name} v${t.version} [${t.risk}]`);
-      await ctx.sendMessage(`*Tools*\n${lines.join('\n')}`);
+      const toolLines = toolList.map(t => `- ${t.name} [${t.risk}]: ${t.description}`);
+      await ctx.sendMessage(`**Tools**\n${toolLines.join('\n')}`);
       return true;
     }
 

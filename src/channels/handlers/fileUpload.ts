@@ -31,7 +31,7 @@ export async function handleFileUpload(
       const artifactId = storeFileArtifact({
         type: `upload_${attachment.type}`,
         title: attachment.filename ?? `upload_${Date.now()}`,
-        filePath: '', // Path set by storage layer
+        path: '', // Path set by storage layer
         fileSize: attachment.size,
         mimeType: attachment.mimeType,
       });

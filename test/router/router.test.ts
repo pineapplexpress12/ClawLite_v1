@@ -56,19 +56,24 @@ describe('Phase 7: Message Router', () => {
   describe('isSimpleChat', () => {
     it('should detect greetings', () => {
       expect(isSimpleChat('hello')).toBe(true);
-      expect(isSimpleChat('Hi there!')).toBe(true);
       expect(isSimpleChat('hey')).toBe(true);
+      expect(isSimpleChat('hi')).toBe(true);
       expect(isSimpleChat('Good morning')).toBe(true);
+      // "Hi there!" is longer/ambiguous — routes to complex (falls back to chat)
+      expect(isSimpleChat('Hi there!')).toBe(false);
     });
 
-    it('should detect gratitude', () => {
-      expect(isSimpleChat('thanks!')).toBe(true);
-      expect(isSimpleChat('Thank you so much')).toBe(true);
+    it('should detect gratitude (short)', () => {
+      expect(isSimpleChat('thanks')).toBe(true);
+      expect(isSimpleChat('thank you')).toBe(true);
+      // Longer gratitude phrases go to complex (which falls back to chat)
+      expect(isSimpleChat('Thank you so much')).toBe(false);
     });
 
-    it('should detect simple questions', () => {
-      expect(isSimpleChat('what is TypeScript?')).toBe(true);
-      expect(isSimpleChat('how do I use git?')).toBe(true);
+    it('should route ambiguous questions to complex (safer default)', () => {
+      // These are NOT simple chat — they route to complex, which falls back to tool-chat
+      expect(isSimpleChat('what is TypeScript?')).toBe(false);
+      expect(isSimpleChat('how do I use git?')).toBe(false);
     });
 
     it('should detect acknowledgments', () => {

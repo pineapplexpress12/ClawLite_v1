@@ -2,7 +2,7 @@ import { stopHeartbeat } from './heartbeat/scheduler.js';
 import { stopAllChannels } from './channels/registry.js';
 import { stopHTTPServer } from './http/server.js';
 import { closeDb } from './db/connection.js';
-import { getJobsByStatus } from './db/jobs.js';
+import { getJobsByStatus, updateJobStatus } from './db/jobs.js';
 import { resetRunningNodesToPending } from './db/nodes.js';
 import { executeJob } from './executor/executeJob.js';
 import { logger } from './core/logger.js';
@@ -46,9 +46,14 @@ export function recoverCrashedJobs(): void {
     logger.info('Recovered crashed nodes', { count: resetCount });
   }
 
-  // Re-attach to active jobs
+  // Re-attach to active jobs, but skip jobs that have been interrupted too many times
   const activeJobs = getJobsByStatus(['running', 'waiting_approval']);
   for (const job of activeJobs) {
+    if (job.total_retries >= 2) {
+      logger.warn('Marking repeatedly interrupted job as failed', { jobId: job.id, retries: job.total_retries });
+      updateJobStatus(job.id, 'failed');
+      continue;
+    }
     logger.info('Re-executing interrupted job', { jobId: job.id });
     executeJob(job.id).catch(err => {
       logger.error('Failed to resume job', { jobId: job.id, error: (err as Error).message });

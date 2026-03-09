@@ -26,6 +26,7 @@ export async function callOpenRouter(
   if (params.tools && params.tools.length > 0) {
     body.tools = params.tools;
     body.tool_choice = params.tool_choice ?? 'auto';
+    body.parallel_tool_calls = false;
   }
 
   const response = await axios.post(OPENROUTER_URL, body, {
